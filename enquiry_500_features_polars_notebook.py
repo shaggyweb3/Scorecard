@@ -206,12 +206,12 @@ SEGMENTS = [
     "business",
     "card",
     "overdraft",
+    "education",
     "vehicle",
     "housing",
     "asset_backed",
     "sbi",
-    "non_sbi",
-    "not_disclosed_lender",
+    "non_sbi_or_not_disclosed_lender",
     "unknown",
 ]
 PRIORITY_PURPOSE_CODES = [5, 6, 8, 9, 10, 12, 25, 37, 39, 50, 51, 61, 69, 71]
@@ -233,8 +233,8 @@ AMOUNT_BANDS = [
 # many repetitive variables. Instead, use broader coverage for core segments and
 # lighter coverage for narrower business/product/lender segments.
 CORE_SEGMENTS = ["all", "secured", "unsecured"]
-PRODUCT_SEGMENTS = ["personal", "professional", "business", "card", "overdraft", "vehicle", "housing", "asset_backed"]
-LENDER_SEGMENTS = ["sbi", "non_sbi", "not_disclosed_lender"]
+PRODUCT_SEGMENTS = ["personal", "professional", "business", "card", "overdraft", "education", "vehicle", "housing", "asset_backed"]
+LENDER_SEGMENTS = ["sbi", "non_sbi_or_not_disclosed_lender"]
 QUALITY_SEGMENTS = ["unknown"]
 PRODUCT_WINDOWS: list[int | None] = [30, 90, 180, 365, 730, None]
 LENDER_WINDOWS: list[int | None] = [30, 90, 180, 365, 730, None]
@@ -356,6 +356,7 @@ def prepare_events(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("broad_product_group") == "business").alias("is_business"),
             (pl.col("broad_product_group") == "card").alias("is_card"),
             (pl.col("broad_product_group") == "overdraft").alias("is_overdraft"),
+            (pl.col("broad_product_group") == "education").alias("is_education"),
             (pl.col("broad_product_group") == "vehicle").alias("is_vehicle"),
             (pl.col("broad_product_group") == "housing").alias("is_housing"),
             (pl.col("broad_product_group") == "asset_backed").alias("is_asset_backed"),
@@ -526,10 +527,8 @@ def segment_condition(segment: str) -> pl.Expr | None:
         return pl.col("is_unsecured")
     if segment == "sbi":
         return pl.col("is_sbi_lender")
-    if segment == "non_sbi":
-        return ~pl.col("is_sbi_lender") & ~pl.col("not_disclosed_lender_flag") & pl.col("lender_std").is_not_null()
-    if segment == "not_disclosed_lender":
-        return pl.col("not_disclosed_lender_flag")
+    if segment == "non_sbi_or_not_disclosed_lender":
+        return ~pl.col("is_sbi_lender") & pl.col("lender_std").is_not_null()
     return pl.col(f"is_{segment}")
 
 
@@ -582,10 +581,7 @@ def add_count_amount_recency_features(
         "cnt": pl.when(cond).then(1).otherwise(0).sum().alias(f"enq_cnt_{segment}_{w}"),
         "amt_sum": pl.col("enq_amt").filter(cond).sum().alias(f"enq_amt_sum_{segment}_{w}"),
         "amt_mean": pl.col("enq_amt").filter(cond).mean().alias(f"enq_amt_mean_{segment}_{w}"),
-        "amt_median": pl.col("enq_amt").filter(cond).median().alias(f"enq_amt_median_{segment}_{w}"),
-        "amt_min": pl.col("enq_amt").filter(cond).min().alias(f"enq_amt_min_{segment}_{w}"),
         "amt_max": pl.col("enq_amt").filter(cond).max().alias(f"enq_amt_max_{segment}_{w}"),
-        "amt_std": pl.col("enq_amt").filter(cond).std().alias(f"enq_amt_std_{segment}_{w}"),
         "days_since_last": pl.col("days_before_observation").filter(cond).min().alias(f"enq_days_since_last_{segment}_{w}"),
     }
     for metric in metrics:
@@ -595,7 +591,7 @@ def add_count_amount_recency_features(
 
 
 # 1. Core all/secured/unsecured features receive richer metrics across all windows.
-core_metrics = ["cnt", "amt_sum", "amt_mean", "amt_median", "amt_min", "amt_max", "amt_std", "days_since_last"]
+core_metrics = ["cnt", "amt_sum", "amt_mean", "amt_max", "days_since_last"]
 for window in WINDOWS:
     for segment in CORE_SEGMENTS:
         add_count_amount_recency_features(segment, window, core_metrics, "core_segment")
@@ -604,8 +600,6 @@ for window in WINDOWS:
     all_cond = window_condition(window)
     agg_exprs.extend(
         [
-            pl.col("enq_amt").filter(all_cond).quantile(0.25).alias(f"enq_amt_p25_all_{w}"),
-            pl.col("enq_amt").filter(all_cond).quantile(0.75).alias(f"enq_amt_p75_all_{w}"),
             pl.col("enq_date_parsed").filter(all_cond).n_unique().alias(f"enq_active_days_all_{w}"),
             pl.col("lender_std").filter(all_cond & ~pl.col("not_disclosed_lender_flag")).n_unique().alias(f"enq_lender_nunique_all_{w}"),
             pl.col("purpose_code").filter(all_cond).n_unique().alias(f"enq_purpose_nunique_all_{w}"),
@@ -617,8 +611,6 @@ for window in WINDOWS:
         ]
     )
     for feature_name in [
-        f"enq_amt_p25_all_{w}",
-        f"enq_amt_p75_all_{w}",
         f"enq_active_days_all_{w}",
         f"enq_lender_nunique_all_{w}",
         f"enq_purpose_nunique_all_{w}",
@@ -836,8 +828,8 @@ for window in WINDOWS:
     )
     if f"enq_cnt_sbi_{w}" in feature_pool_df.columns:
         ratio_exprs.append(safe_ratio(f"enq_cnt_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_sbi_{w}"))
-    if f"enq_cnt_non_sbi_{w}" in feature_pool_df.columns:
-        ratio_exprs.append(safe_ratio(f"enq_cnt_non_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_non_sbi_{w}"))
+    if f"enq_cnt_non_sbi_or_not_disclosed_lender_{w}" in feature_pool_df.columns:
+        ratio_exprs.append(safe_ratio(f"enq_cnt_non_sbi_or_not_disclosed_lender_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_non_sbi_or_not_disclosed_lender_{w}"))
     for fname in [
         f"enq_flag_no_history_{w}",
         f"enq_share_cnt_unsecured_{w}",
