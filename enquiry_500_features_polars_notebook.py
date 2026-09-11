@@ -536,6 +536,31 @@ def safe_ratio(num: str, den: str, alias: str) -> pl.Expr:
     return pl.when(pl.col(den).is_null() | (pl.col(den) == 0)).then(None).otherwise(pl.col(num) / pl.col(den)).alias(alias)
 
 
+def expected_values_for_feature(name: str, family: str) -> str:
+    """Describe the usual value range/type for feature documentation."""
+    if name.startswith("enq_flag_"):
+        return "0 or 1"
+    if name.startswith("enq_trend_"):
+        return "signed numeric; positive means recent activity is higher"
+    if name.startswith("enq_shift_"):
+        return "signed decimal, usually -1 to 1; positive means recent share is higher"
+    if "_share_" in name:
+        return "decimal share, usually 0 to 1; null if denominator is zero"
+    if name.startswith("enq_velocity_"):
+        return "decimal ratio >= 0; null if denominator is zero"
+    if "days_since" in name or family == "gap":
+        return "days >= 0; null if no eligible enquiry exists"
+    if "_cnt_" in name or "_nunique_" in name or name.endswith("_count"):
+        return "integer count >= 0"
+    if "_amt_" in name or "_amount" in name:
+        return "amount in source currency; null if no non-null amount exists"
+    if name.startswith("enq_largest_"):
+        return "decimal share, usually 0 to 1"
+    if name.startswith("enq_interaction_"):
+        return "numeric interaction value; validate distribution before modelling"
+    return "numeric candidate value; inspect distribution before modelling"
+
+
 def register_feature(name: str, family: str, formula: str, window: int | None, segment: str) -> None:
     feature_dictionary_rows.append(
         {
@@ -544,6 +569,7 @@ def register_feature(name: str, family: str, formula: str, window: int | None, s
             "formula": formula,
             "lookback_window": win_suffix(window),
             "segment": segment,
+            "expected_values": expected_values_for_feature(name, family),
             "source_columns": "custid,mrn,input_date,enq_date,enq_purpose,enq_amt,short_name,ecn",
             "missing_treatment": "Missing amounts remain null; count nulls separately; future enquiries excluded.",
             "leakage_control": "Uses only enq_date <= input_date.",
@@ -765,11 +791,13 @@ print("After shopping features:", feature_pool_df.shape)
 # %% [markdown]
 # ## Cell 14 - Concentration Features
 #
-# HHI closer to 1 means enquiries are concentrated in fewer purpose/lender categories.
+# The notebook keeps largest-share concentration because it is simple to explain:
+# a value close to 1 means one purpose/lender dominates the enquiry history.
+# HHI and entropy are intentionally excluded from the production candidate pool.
 
 # %%
-# Cell 14 - HHI and entropy features
-def hhi_entropy_by_column(events: pl.DataFrame, group_col: str, prefix: str, window: int | None) -> pl.DataFrame:
+# Cell 14 - Largest-share concentration features
+def largest_share_by_column(events: pl.DataFrame, group_col: str, prefix: str, window: int | None) -> pl.DataFrame:
     w = win_suffix(window)
     subset = events.filter(window_condition(window))
     total = subset.group_by(KEY_COLS).len().rename({"len": "_total"})
@@ -780,9 +808,7 @@ def hhi_entropy_by_column(events: pl.DataFrame, group_col: str, prefix: str, win
         .group_by(KEY_COLS)
         .agg(
             [
-                (pl.col("_share") ** 2).sum().alias(f"enq_hhi_{prefix}_{w}"),
                 pl.col("_share").max().alias(f"enq_largest_{prefix}_share_{w}"),
-                (-(pl.col("_share") * pl.col("_share").log())).sum().alias(f"enq_entropy_{prefix}_{w}"),
             ]
         )
     )
@@ -791,11 +817,11 @@ def hhi_entropy_by_column(events: pl.DataFrame, group_col: str, prefix: str, win
 concentration_df = observation_base_df.select(KEY_COLS)
 for window in CONCENTRATION_WINDOWS:
     for group_col, prefix in [("purpose_code", "purpose"), ("lender_std", "lender")]:
-        temp = hhi_entropy_by_column(eligible_events_df, group_col, prefix, window)
+        temp = largest_share_by_column(eligible_events_df, group_col, prefix, window)
         concentration_df = concentration_df.join(temp, on=KEY_COLS, how="left")
         for fname in temp.columns:
             if fname not in KEY_COLS:
-                register_feature(fname, "concentration", f"HHI/entropy/largest share by {prefix}", window, prefix)
+                register_feature(fname, "concentration", f"largest category share by {prefix}", window, prefix)
 
 feature_pool_df = feature_pool_df.join(concentration_df, on=KEY_COLS, how="left")
 print("After concentration features:", feature_pool_df.shape)
@@ -828,16 +854,25 @@ for window in WINDOWS:
     )
     if f"enq_cnt_sbi_{w}" in feature_pool_df.columns:
         ratio_exprs.append(safe_ratio(f"enq_cnt_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_sbi_{w}"))
+        register_feature(f"enq_share_cnt_sbi_{w}", "ratio_share_flag", "SBI count divided by total count", window, "sbi")
     if f"enq_cnt_non_sbi_or_not_disclosed_lender_{w}" in feature_pool_df.columns:
         ratio_exprs.append(safe_ratio(f"enq_cnt_non_sbi_or_not_disclosed_lender_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_non_sbi_or_not_disclosed_lender_{w}"))
-    for fname in [
-        f"enq_flag_no_history_{w}",
-        f"enq_share_cnt_unsecured_{w}",
-        f"enq_share_amt_unsecured_{w}",
-        f"enq_share_cnt_sbi_{w}",
-        f"enq_amt_missing_rate_{w}",
+        register_feature(f"enq_share_cnt_non_sbi_or_not_disclosed_lender_{w}", "ratio_share_flag", "non-SBI or not-disclosed lender count divided by total count", window, "non_sbi_or_not_disclosed_lender")
+    for segment in PRODUCT_SEGMENTS:
+        if f"enq_cnt_{segment}_{w}" in feature_pool_df.columns:
+            ratio_exprs.append(safe_ratio(f"enq_cnt_{segment}_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_{segment}_{w}"))
+            register_feature(f"enq_share_cnt_{segment}_{w}", "ratio_share_flag", "product segment count divided by total count", window, segment)
+    for fname, segment in [
+        (f"enq_flag_no_history_{w}", "all"),
+        (f"enq_flag_any_history_{w}", "all"),
+        (f"enq_flag_multiple_enquiries_{w}", "all"),
+        (f"enq_share_cnt_unsecured_{w}", "unsecured"),
+        (f"enq_share_cnt_secured_{w}", "secured"),
+        (f"enq_share_amt_unsecured_{w}", "unsecured"),
+        (f"enq_share_amt_secured_{w}", "secured"),
+        (f"enq_amt_missing_rate_{w}", "all"),
     ]:
-        register_feature(fname, "ratio_share_flag", "post-aggregation ratio/share/flag", window, "all")
+        register_feature(fname, "ratio_share_flag", "post-aggregation ratio/share/flag", window, segment)
 
 for short, long in [(7, 30), (15, 60), (30, 90), (90, 180), (180, 365), (365, 730)]:
     ratio_exprs.extend(
@@ -845,11 +880,36 @@ for short, long in [(7, 30), (15, 60), (30, 90), (90, 180), (180, 365), (365, 73
             safe_ratio(f"enq_cnt_all_{short}d", f"enq_cnt_all_{long}d", f"enq_velocity_cnt_{short}d_to_{long}d"),
             safe_ratio(f"enq_amt_sum_all_{short}d", f"enq_amt_sum_all_{long}d", f"enq_velocity_amt_{short}d_to_{long}d"),
             safe_ratio(f"enq_cnt_unsecured_{short}d", f"enq_cnt_unsecured_{long}d", f"enq_velocity_unsecured_cnt_{short}d_to_{long}d"),
+            safe_ratio(f"enq_cnt_secured_{short}d", f"enq_cnt_secured_{long}d", f"enq_velocity_secured_cnt_{short}d_to_{long}d"),
         ]
     )
     register_feature(f"enq_velocity_cnt_{short}d_to_{long}d", "velocity", "short window count divided by long window count", short, "all")
     register_feature(f"enq_velocity_amt_{short}d_to_{long}d", "velocity", "short window amount divided by long window amount", short, "all")
     register_feature(f"enq_velocity_unsecured_cnt_{short}d_to_{long}d", "velocity", "short unsecured count divided by long unsecured count", short, "unsecured")
+    register_feature(f"enq_velocity_secured_cnt_{short}d_to_{long}d", "velocity", "short secured count divided by long secured count", short, "secured")
+
+important_velocity_specs = [
+    ("personal", "cnt", 30, 180),
+    ("professional", "cnt", 30, 180),
+    ("business", "cnt", 30, 180),
+    ("card", "cnt", 30, 180),
+    ("sbi", "cnt", 30, 180),
+    ("non_sbi_or_not_disclosed_lender", "cnt", 30, 180),
+    ("secured", "amt_sum", 30, 180),
+    ("unsecured", "amt_sum", 30, 180),
+    ("personal", "amt_sum", 30, 180),
+    ("professional", "amt_sum", 30, 180),
+    ("business", "amt_sum", 30, 180),
+]
+
+for segment, metric, short, long in important_velocity_specs:
+    short_col = f"enq_{metric}_{segment}_{short}d"
+    long_col = f"enq_{metric}_{segment}_{long}d"
+    metric_label = "amt" if metric == "amt_sum" else metric
+    feature_name = f"enq_velocity_{segment}_{metric_label}_{short}d_to_{long}d"
+    if short_col in feature_pool_df.columns and long_col in feature_pool_df.columns:
+        ratio_exprs.append(safe_ratio(short_col, long_col, feature_name))
+        register_feature(feature_name, "velocity", f"important {segment} {metric_label} acceleration versus longer window", short, segment)
 
 # First create ratios, shares, flags, and velocity variables.
 feature_pool_df = feature_pool_df.with_columns(ratio_exprs)
@@ -860,6 +920,8 @@ interaction_exprs.extend(
         (pl.col("enq_cnt_all_30d") - (pl.col("enq_cnt_all_60d") - pl.col("enq_cnt_all_30d"))).alias("enq_trend_cnt_0_30_vs_31_60"),
         (pl.col("enq_cnt_all_90d") - (pl.col("enq_cnt_all_180d") - pl.col("enq_cnt_all_90d"))).alias("enq_trend_cnt_0_90_vs_91_180"),
         (pl.col("enq_share_cnt_unsecured_30d") - pl.col("enq_share_cnt_unsecured_180d")).alias("enq_shift_unsecured_share_30d_vs_180d"),
+        (pl.col("enq_share_cnt_sbi_30d") - pl.col("enq_share_cnt_sbi_180d")).alias("enq_shift_sbi_share_30d_vs_180d"),
+        (pl.col("enq_share_cnt_non_sbi_or_not_disclosed_lender_30d") - pl.col("enq_share_cnt_non_sbi_or_not_disclosed_lender_180d")).alias("enq_shift_non_sbi_or_not_disclosed_lender_share_30d_vs_180d"),
         (pl.col("enq_cnt_all_30d") * pl.col("enq_amt_max_all_30d")).alias("enq_interaction_recent_cnt_x_max_amt_30d"),
         (pl.col("enq_cnt_professional_365d") * pl.col("enq_cnt_business_365d")).alias("enq_interaction_professional_x_business_365d"),
         (pl.col("enq_cnt_personal_180d") * pl.col("enq_cnt_card_180d")).alias("enq_interaction_personal_x_card_180d"),
@@ -867,16 +929,34 @@ interaction_exprs.extend(
     ]
 )
 
-for fname in [
-    "enq_trend_cnt_0_30_vs_31_60",
-    "enq_trend_cnt_0_90_vs_91_180",
-    "enq_shift_unsecured_share_30d_vs_180d",
-    "enq_interaction_recent_cnt_x_max_amt_30d",
-    "enq_interaction_professional_x_business_365d",
-    "enq_interaction_personal_x_card_180d",
-    "enq_interaction_lender_diversity_x_recent_cnt",
+for segment in ["secured", "unsecured", "personal", "professional", "business", "card"]:
+    short_col = f"enq_cnt_{segment}_30d"
+    long_col = f"enq_cnt_{segment}_180d"
+    feature_name = f"enq_trend_cnt_{segment}_0_30_vs_31_180_avg"
+    if short_col in feature_pool_df.columns and long_col in feature_pool_df.columns:
+        interaction_exprs.append((pl.col(short_col) - ((pl.col(long_col) - pl.col(short_col)) / 5)).alias(feature_name))
+        register_feature(feature_name, "trend_or_interaction", f"recent 30d {segment} count minus average 30d count from days 31-180", None, segment)
+
+for segment in ["secured", "personal", "professional", "business", "card", "overdraft", "education"]:
+    short_col = f"enq_share_cnt_{segment}_30d"
+    long_col = f"enq_share_cnt_{segment}_180d"
+    feature_name = f"enq_shift_{segment}_share_30d_vs_180d"
+    if short_col in feature_pool_df.columns and long_col in feature_pool_df.columns:
+        interaction_exprs.append((pl.col(short_col) - pl.col(long_col)).alias(feature_name))
+        register_feature(feature_name, "trend_or_interaction", f"30d {segment} count share minus 180d {segment} count share", None, segment)
+
+for fname, segment in [
+    ("enq_trend_cnt_0_30_vs_31_60", "all"),
+    ("enq_trend_cnt_0_90_vs_91_180", "all"),
+    ("enq_shift_unsecured_share_30d_vs_180d", "unsecured"),
+    ("enq_shift_sbi_share_30d_vs_180d", "sbi"),
+    ("enq_shift_non_sbi_or_not_disclosed_lender_share_30d_vs_180d", "non_sbi_or_not_disclosed_lender"),
+    ("enq_interaction_recent_cnt_x_max_amt_30d", "all"),
+    ("enq_interaction_professional_x_business_365d", "professional_business"),
+    ("enq_interaction_personal_x_card_180d", "personal_card"),
+    ("enq_interaction_lender_diversity_x_recent_cnt", "all"),
 ]:
-    register_feature(fname, "trend_or_interaction", "interpretable trend or interaction variable", None, "all")
+    register_feature(fname, "trend_or_interaction", "interpretable trend or interaction variable", None, segment)
 
 feature_pool_df = feature_pool_df.with_columns(interaction_exprs)
 print("After ratios/interactions:", feature_pool_df.shape)
