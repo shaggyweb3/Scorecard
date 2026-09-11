@@ -228,6 +228,21 @@ AMOUNT_BANDS = [
     ("gt_5m", 5_000_000, None),
 ]
 
+# Expert feature-control plan:
+# We do not create every metric for every segment/window because that produces
+# many repetitive variables. Instead, use broader coverage for core segments and
+# lighter coverage for narrower business/product/lender segments.
+CORE_SEGMENTS = ["all", "secured", "unsecured"]
+PRODUCT_SEGMENTS = ["personal", "professional", "business", "card", "overdraft", "vehicle", "housing", "asset_backed"]
+LENDER_SEGMENTS = ["sbi", "non_sbi", "not_disclosed_lender"]
+QUALITY_SEGMENTS = ["unknown"]
+PRODUCT_WINDOWS: list[int | None] = [30, 90, 180, 365, 730, None]
+LENDER_WINDOWS: list[int | None] = [30, 90, 180, 365, 730, None]
+AMOUNT_BAND_WINDOWS: list[int | None] = [30, 90, 180, 365, 730, None]
+PURPOSE_CODE_WINDOWS: list[int | None] = [90, 365, 730, None]
+RATIO_WINDOWS: list[int | None] = [30, 90, 180, 365, 730, None]
+CONCENTRATION_WINDOWS: list[int | None] = [90, 180, 365, 730, None]
+
 purpose_map_df = pl.DataFrame(
     [
         {
@@ -538,49 +553,57 @@ def register_feature(name: str, family: str, formula: str, window: int | None, s
     )
 
 # %% [markdown]
-# ## Cell 10 - Build Controlled Feature Pool
+# ## Cell 10 - Build Curated Feature Pool
 #
-# This cell creates a larger meaningful feature pool. Later cells remove all-null/constant variables and keep up to 500.
+# This cell avoids a blind cross-product of every metric with every segment/window.
+# Instead it creates a tiered, business-prioritized feature pool:
+# - Core segments get richer metrics across all windows.
+# - Product/lender segments get selected high-value metrics and windows.
+# - Purpose-code variables are limited to priority codes.
+# - Amount-band variables are generated only for selected windows.
 
 # %%
-# Cell 10 - Aggregation expressions for counts, amounts, recency, segments, and purpose codes
+# Cell 10 - Curated aggregation expressions for counts, amounts, recency, segments, and purpose codes
 agg_exprs: list[pl.Expr] = []
 
-for window in WINDOWS:
+def add_count_amount_recency_features(
+    segment: str,
+    window: int | None,
+    metrics: list[str],
+    family: str,
+) -> None:
+    """Add selected metric expressions for one segment/window.
+
+    This is the main control point that prevents feature explosion.
+    """
     w = win_suffix(window)
+    cond = window_condition(window, segment_condition(segment))
+    metric_exprs = {
+        "cnt": pl.when(cond).then(1).otherwise(0).sum().alias(f"enq_cnt_{segment}_{w}"),
+        "amt_sum": pl.col("enq_amt").filter(cond).sum().alias(f"enq_amt_sum_{segment}_{w}"),
+        "amt_mean": pl.col("enq_amt").filter(cond).mean().alias(f"enq_amt_mean_{segment}_{w}"),
+        "amt_median": pl.col("enq_amt").filter(cond).median().alias(f"enq_amt_median_{segment}_{w}"),
+        "amt_min": pl.col("enq_amt").filter(cond).min().alias(f"enq_amt_min_{segment}_{w}"),
+        "amt_max": pl.col("enq_amt").filter(cond).max().alias(f"enq_amt_max_{segment}_{w}"),
+        "amt_std": pl.col("enq_amt").filter(cond).std().alias(f"enq_amt_std_{segment}_{w}"),
+        "days_since_last": pl.col("days_before_observation").filter(cond).min().alias(f"enq_days_since_last_{segment}_{w}"),
+    }
+    for metric in metrics:
+        agg_exprs.append(metric_exprs[metric])
+        feature_name = metric_exprs[metric].meta.output_name()
+        register_feature(feature_name, family, f"{metric} for {segment} in {w}", window, segment)
 
-    for segment in SEGMENTS:
-        seg_cond = segment_condition(segment)
-        cond = window_condition(window, seg_cond)
 
-        names = {
-            "cnt": f"enq_cnt_{segment}_{w}",
-            "amt_sum": f"enq_amt_sum_{segment}_{w}",
-            "amt_mean": f"enq_amt_mean_{segment}_{w}",
-            "amt_median": f"enq_amt_median_{segment}_{w}",
-            "amt_max": f"enq_amt_max_{segment}_{w}",
-            "days_last": f"enq_days_since_last_{segment}_{w}",
-        }
+# 1. Core all/secured/unsecured features receive richer metrics across all windows.
+core_metrics = ["cnt", "amt_sum", "amt_mean", "amt_median", "amt_min", "amt_max", "amt_std", "days_since_last"]
+for window in WINDOWS:
+    for segment in CORE_SEGMENTS:
+        add_count_amount_recency_features(segment, window, core_metrics, "core_segment")
 
-        agg_exprs.extend(
-            [
-                pl.when(cond).then(1).otherwise(0).sum().alias(names["cnt"]),
-                pl.col("enq_amt").filter(cond).sum().alias(names["amt_sum"]),
-                pl.col("enq_amt").filter(cond).mean().alias(names["amt_mean"]),
-                pl.col("enq_amt").filter(cond).median().alias(names["amt_median"]),
-                pl.col("enq_amt").filter(cond).max().alias(names["amt_max"]),
-                pl.col("days_before_observation").filter(cond).min().alias(names["days_last"]),
-            ]
-        )
-
-        for metric_name, feature_name in names.items():
-            register_feature(feature_name, f"{metric_name}_by_segment", f"{metric_name} for {segment} in {w}", window, segment)
-
+    w = win_suffix(window)
     all_cond = window_condition(window)
     agg_exprs.extend(
         [
-            pl.col("enq_amt").filter(all_cond).min().alias(f"enq_amt_min_all_{w}"),
-            pl.col("enq_amt").filter(all_cond).std().alias(f"enq_amt_std_all_{w}"),
             pl.col("enq_amt").filter(all_cond).quantile(0.25).alias(f"enq_amt_p25_all_{w}"),
             pl.col("enq_amt").filter(all_cond).quantile(0.75).alias(f"enq_amt_p75_all_{w}"),
             pl.col("enq_date_parsed").filter(all_cond).n_unique().alias(f"enq_active_days_all_{w}"),
@@ -594,17 +617,39 @@ for window in WINDOWS:
         ]
     )
     for feature_name in [
-        f"enq_amt_min_all_{w}",
-        f"enq_amt_std_all_{w}",
+        f"enq_amt_p25_all_{w}",
+        f"enq_amt_p75_all_{w}",
         f"enq_active_days_all_{w}",
         f"enq_lender_nunique_all_{w}",
         f"enq_purpose_nunique_all_{w}",
+        f"enq_product_group_nunique_all_{w}",
         f"enq_amt_missing_cnt_all_{w}",
+        f"enq_amt_zero_cnt_all_{w}",
+        f"enq_amt_negative_cnt_all_{w}",
         f"enq_cnt_same_day_all_{w}",
     ]:
         register_feature(feature_name, "overall_extra", feature_name, window, "all")
 
-    # Amount-band counts for analytical bands.
+# 2. Product segments get compact but useful count, amount, and recency metrics.
+product_metrics = ["cnt", "amt_sum", "amt_max", "days_since_last"]
+for window in PRODUCT_WINDOWS:
+    for segment in PRODUCT_SEGMENTS:
+        add_count_amount_recency_features(segment, window, product_metrics, "product_segment")
+
+# 3. Lender segments are useful but can be unstable, so keep them compact.
+lender_metrics = ["cnt", "amt_sum", "days_since_last"]
+for window in LENDER_WINDOWS:
+    for segment in LENDER_SEGMENTS:
+        add_count_amount_recency_features(segment, window, lender_metrics, "lender_segment")
+
+# 4. Unknown-code segment is monitoring-first; count and amount are enough.
+for window in [90, 365, 730, None]:
+    add_count_amount_recency_features("unknown", window, ["cnt", "amt_sum"], "unknown_purpose_monitoring")
+
+# 5. Amount-band counts for analytical bands and selected windows only.
+for window in AMOUNT_BAND_WINDOWS:
+    w = win_suffix(window)
+    all_cond = window_condition(window)
     for band_name, lower, upper in AMOUNT_BANDS:
         if band_name == "missing":
             band_expr = pl.col("enq_amt").is_null()
@@ -618,15 +663,14 @@ for window in WINDOWS:
         agg_exprs.append(pl.when(all_cond & band_expr).then(1).otherwise(0).sum().alias(fname))
         register_feature(fname, "amount_band", f"count of enquiries in amount band {band_name}", window, band_name)
 
-# Purpose-code features are intentionally limited to selected business-relevant purpose codes.
-for window in [30, 90, 180, 365, 730, None]:
+# 6. Purpose-code features are limited to priority codes and selected windows.
+for window in PURPOSE_CODE_WINDOWS:
     w = win_suffix(window)
     for code in PRIORITY_PURPOSE_CODES:
         cond = window_condition(window, pl.col("purpose_code") == code)
         for metric_name, expr in {
             "cnt": pl.when(cond).then(1).otherwise(0).sum(),
             "amt_sum": pl.col("enq_amt").filter(cond).sum(),
-            "amt_max": pl.col("enq_amt").filter(cond).max(),
             "days_since_last": pl.col("days_before_observation").filter(cond).min(),
         }.items():
             fname = f"enq_{metric_name}_code_{code}_{w}"
@@ -648,7 +692,7 @@ feature_pool_df = observation_base_df.join(feature_pool_df, on=KEY_COLS, how="le
 count_like_cols = [
     c
     for c in feature_pool_df.columns
-    if c.startswith("enq_cnt_") or c.startswith("enq_active_") or c.endswith("_nunique_all_7d")
+    if c.startswith("enq_cnt_") or c.startswith("enq_active_") or "_nunique_" in c
 ]
 feature_pool_df = feature_pool_df.with_columns([pl.col(c).fill_null(0) for c in count_like_cols])
 
@@ -753,7 +797,7 @@ def hhi_entropy_by_column(events: pl.DataFrame, group_col: str, prefix: str, win
 
 
 concentration_df = observation_base_df.select(KEY_COLS)
-for window in [30, 90, 180, 365, 730, None]:
+for window in CONCENTRATION_WINDOWS:
     for group_col, prefix in [("purpose_code", "purpose"), ("lender_std", "lender")]:
         temp = hhi_entropy_by_column(eligible_events_df, group_col, prefix, window)
         concentration_df = concentration_df.join(temp, on=KEY_COLS, how="left")
@@ -787,11 +831,13 @@ for window in WINDOWS:
             safe_ratio(f"enq_cnt_secured_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_secured_{w}"),
             safe_ratio(f"enq_amt_sum_unsecured_{w}", f"enq_amt_sum_all_{w}", f"enq_share_amt_unsecured_{w}"),
             safe_ratio(f"enq_amt_sum_secured_{w}", f"enq_amt_sum_all_{w}", f"enq_share_amt_secured_{w}"),
-            safe_ratio(f"enq_cnt_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_sbi_{w}"),
-            safe_ratio(f"enq_cnt_non_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_non_sbi_{w}"),
             safe_ratio(f"enq_amt_missing_cnt_all_{w}", f"enq_cnt_all_{w}", f"enq_amt_missing_rate_{w}"),
         ]
     )
+    if f"enq_cnt_sbi_{w}" in feature_pool_df.columns:
+        ratio_exprs.append(safe_ratio(f"enq_cnt_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_sbi_{w}"))
+    if f"enq_cnt_non_sbi_{w}" in feature_pool_df.columns:
+        ratio_exprs.append(safe_ratio(f"enq_cnt_non_sbi_{w}", f"enq_cnt_all_{w}", f"enq_share_cnt_non_sbi_{w}"))
     for fname in [
         f"enq_flag_no_history_{w}",
         f"enq_share_cnt_unsecured_{w}",
@@ -821,7 +867,7 @@ interaction_exprs.extend(
     [
         (pl.col("enq_cnt_all_30d") - (pl.col("enq_cnt_all_60d") - pl.col("enq_cnt_all_30d"))).alias("enq_trend_cnt_0_30_vs_31_60"),
         (pl.col("enq_cnt_all_90d") - (pl.col("enq_cnt_all_180d") - pl.col("enq_cnt_all_90d"))).alias("enq_trend_cnt_0_90_vs_91_180"),
-        (pl.col("enq_cnt_all_30d") * pl.col("enq_share_cnt_unsecured_30d")).alias("enq_interaction_recent_cnt_x_unsecured_share_30d"),
+        (pl.col("enq_share_cnt_unsecured_30d") - pl.col("enq_share_cnt_unsecured_180d")).alias("enq_shift_unsecured_share_30d_vs_180d"),
         (pl.col("enq_cnt_all_30d") * pl.col("enq_amt_max_all_30d")).alias("enq_interaction_recent_cnt_x_max_amt_30d"),
         (pl.col("enq_cnt_professional_365d") * pl.col("enq_cnt_business_365d")).alias("enq_interaction_professional_x_business_365d"),
         (pl.col("enq_cnt_personal_180d") * pl.col("enq_cnt_card_180d")).alias("enq_interaction_personal_x_card_180d"),
@@ -832,7 +878,7 @@ interaction_exprs.extend(
 for fname in [
     "enq_trend_cnt_0_30_vs_31_60",
     "enq_trend_cnt_0_90_vs_91_180",
-    "enq_interaction_recent_cnt_x_unsecured_share_30d",
+    "enq_shift_unsecured_share_30d_vs_180d",
     "enq_interaction_recent_cnt_x_max_amt_30d",
     "enq_interaction_professional_x_business_365d",
     "enq_interaction_personal_x_card_180d",
@@ -869,6 +915,11 @@ for col in candidate_cols:
             "n_unique": n_unique,
             "is_all_null": non_null_count == 0,
             "is_constant_or_single_value": n_unique <= 1,
+            "recommended_action": "drop_all_null"
+            if non_null_count == 0
+            else "drop_constant"
+            if n_unique <= 1
+            else "retain_candidate",
         }
     )
 
@@ -891,6 +942,13 @@ print("Total generated feature pool columns:", len(candidate_cols))
 print("Usable non-constant feature columns:", len(usable_feature_names))
 print("Final selected feature columns:", len(selected_feature_names))
 print("Final feature table shape:", final_features_df.shape)
+
+if len(selected_feature_names) < MAX_FEATURES:
+    print(
+        "Note: fewer than MAX_FEATURES were retained because the data did not "
+        "contain enough non-constant/non-null candidate variables. This is expected "
+        "when only a small number of purpose codes or segments are present."
+    )
 
 feature_quality_df.head(20)
 
